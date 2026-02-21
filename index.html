@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>F1 2D Pro - Red Bull RB20 Trainer</title>
+    <style>
+        body {
+            margin: 0;
+            background: #111;
+            color: white;
+            font-family: 'Segoe UI', sans-serif;
+            overflow: hidden;
+        }
+
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            pointer-events: none;
+        }
+
+        .stat {
+            font-size: 32px;
+            font-weight: bold;
+            font-style: italic;
+            color: #fff;
+            text-shadow: 2px 2px 0px #f00;
+        }
+
+        .hint {
+            font-size: 14px;
+            opacity: 0.7;
+            color: #0cf;
+            margin-top: 5px;
+        }
+
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="ui">
+        <div id="speed" class="stat">0 KM/H</div>
+        <div id="gear" style="font-size: 20px; color: #ffeb3b;">GEAR: N</div>
+        <div id="progress" style="font-size: 20px; color: #4caf50;">PROGRESS: 0%</div>
+        <div class="hint">WASD to Drive | AI Socket Ready</div>
+    </div>
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // --- TRACK CONFIG ---
+        const trackPoints = [
+            { x: 500, y: 800 }, { x: 1500, y: 800 }, { x: 1800, y: 1200 },
+            { x: 2200, y: 800 }, { x: 2200, y: 200 }, { x: 1500, y: 100 },
+            { x: 1000, y: 400 }, { x: 500, y: 200 }, { x: 200, y: 500 }
+        ];
+        const TRACK_WIDTH = 130;
+
+        // --- STATE ---
+        let car = { x: 500, y: 800, angle: 0, speed: 0 };
+        let particles = [];
+        const keys = {};
+        let sensorDistances = [0, 0, 0, 0, 0];
+        let aiSteer = 0, aiThrottle = 0, useAI = false;
+        let onTrackGlobal = true;
+        let progress = 0;
+
+        // --- SOCKET ---
+        const socket = new WebSocket('ws://localhost:8765');
+
+        function sendState() {
+            if (socket.readyState === WebSocket.OPEN) {
+                // Calculate rough percentage around the track based on X/Y
+                socket.send(JSON.stringify({
+                    sensors: sensorDistances,
+                    speed: car.speed,
+                    onTrack: onTrackGlobal,
+                    x: car.x,
+                    y: car.y
+                }));
+            }
+        }
+
+        socket.onmessage = (e) => {
+            const cmd = JSON.parse(e.data);
+            if (cmd.command === "reset") {
+                resetCar();
+                update();
+                sendState();
+                return;
+            }
+            aiSteer = cmd.steer; aiThrottle = cmd.throttle;
+            // Only let AI take over if we aren't touching keys
+            if (!Object.values(keys).some(v => v)) {
+                useAI = true;
+                update();
+                sendState();
+            } else {
+                useAI = false;
+            }
+        };
+
+        function resetCar() {
+            car = { x: 500, y: 800, angle: 0, speed: 0 };
+        }
+
+        window.addEventListener('keydown', e => {
+            keys[e.key.toLowerCase()] = true;
+            useAI = false; // Player takes control
+        });
+        window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+        function getTrackPath() {
+            const path = new Path2D();
+            path.moveTo(trackPoints[0].x, trackPoints[0].y);
+            for (let i = 0; i < trackPoints.length; i++) {
+                const p1 = trackPoints[i];
+                const p2 = trackPoints[(i + 1) % trackPoints.length];
+                const midX = (p1.x + p2.x) / 2;
+                const midY = (p1.y + p2.y) / 2;
+                path.quadraticCurveTo(p1.x, p1.y, midX, midY);
+            }
+            path.closePath();
+            return path;
+        }
+        const trackPath = getTrackPath();
+
+        function update() {
+            let throttle = useAI ? aiThrottle : (keys['w'] ? 1 : (keys['s'] ? -0.5 : 0));
+            let steerInput = useAI ? aiSteer : (keys['a'] ? -1 : (keys['d'] ? 1 : 0));
+
+            // Physics logic
+            car.speed += throttle * 0.45;
+            car.speed *= 0.98;
+            car.angle += steerInput * (car.speed * 0.006);
+
+            const nextX = car.x + Math.cos(car.angle) * car.speed;
+            const nextY = car.y + Math.sin(car.angle) * car.speed;
+
+            ctx.lineWidth = TRACK_WIDTH;
+            onTrackGlobal = ctx.isPointInStroke(trackPath, nextX, nextY);
+            if (onTrackGlobal) {
+                car.x = nextX;
+                car.y = nextY;
+
+                // Super rough progress calculation based on distance from start
+                let distFromStart = Math.hypot(car.x - 500, car.y - 800);
+                // The furthest point is roughly at (2200, 200) which is ~1800 units away
+                // The full lap is roughly ~4000+ units. We'll simply show distance for now.
+                progress = Math.round(distFromStart);
+            } else {
+                car.speed *= 0.85; // Heavier grass penalty for 2D
+                if (Math.abs(car.speed) > 2) {
+                    // Spawn grass particles
+                    particles.push({ x: car.x, y: car.y, life: 1, col: "#4a7c44" });
+                }
+            }
+
+            // Tire sparks when turning hard at speed
+            if (Math.abs(car.speed) > 10 && Math.abs(steerInput) > 0.8) {
+                particles.push({
+                    x: car.x - Math.cos(car.angle) * 15,
+                    y: car.y - Math.sin(car.angle) * 15,
+                    life: 1.0,
+                    col: "#ffcc00"
+                });
+            }
+
+            particles.forEach(p => p.life -= 0.04);
+            particles = particles.filter(p => p.life > 0);
+
+            // Sensor Update
+            const sensorAngles = [-0.6, -0.3, 0, 0.3, 0.6];
+            sensorDistances = sensorAngles.map(sa => {
+                let d = 0;
+                while (d < 350) {
+                    const cx = car.x + Math.cos(car.angle + sa) * d;
+                    const cy = car.y + Math.sin(car.angle + sa) * d;
+                    if (!ctx.isPointInStroke(trackPath, cx, cy)) break;
+                    d += 15;
+                }
+                return d;
+            });
+
+            // Socket sending logic moved to sendState() function
+
+        }
+
+        function draw() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            ctx.fillStyle = "#2d5a27";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.save();
+            ctx.translate(canvas.width / 2 - car.x, canvas.height / 2 - car.y);
+
+            // Kerbs
+            ctx.setLineDash([30, 30]);
+            ctx.strokeStyle = "#fff"; ctx.lineWidth = TRACK_WIDTH + 15; ctx.stroke(trackPath);
+            ctx.strokeStyle = "#f00"; ctx.lineDashOffset = 30; ctx.stroke(trackPath);
+
+            // Asphalt
+            ctx.setLineDash([]);
+            ctx.strokeStyle = "#222"; ctx.lineWidth = TRACK_WIDTH; ctx.stroke(trackPath);
+
+            // Particles
+            particles.forEach(p => {
+                ctx.fillStyle = p.col;
+                ctx.globalAlpha = p.life;
+                ctx.beginPath(); ctx.arc(p.x, p.y, 3 * p.life, 0, Math.PI * 2); ctx.fill();
+            });
+            ctx.globalAlpha = 1;
+
+            // --- DRAW RB20 ---
+            ctx.save();
+            ctx.translate(car.x, car.y);
+            ctx.rotate(car.angle);
+
+            // Shadow
+            ctx.fillStyle = "rgba(0,0,0,0.4)";
+            ctx.fillRect(-20, -10, 50, 26);
+
+            // Chassis (Red Bull Navy)
+            ctx.fillStyle = "#001a30";
+            ctx.fillRect(-25, -12, 40, 24); // Body
+            ctx.beginPath(); // Nose
+            ctx.moveTo(15, -8); ctx.lineTo(40, -4); ctx.lineTo(40, 4); ctx.lineTo(15, 8);
+            ctx.fill();
+
+            // Wings (Carbon)
+            ctx.fillStyle = "#111";
+            ctx.fillRect(32, -22, 8, 44); // Front
+            ctx.fillRect(-35, -18, 12, 36); // Rear
+
+            // Livery Accents
+            ctx.fillStyle = "#ffeb3b"; // Yellow Engine Cover
+            ctx.beginPath(); ctx.arc(0, 0, 5, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = "#ff0000"; // Red Nose Stripe
+            ctx.fillRect(18, -2, 12, 4);
+
+            // Wheels
+            ctx.fillStyle = "#000";
+            ctx.fillRect(15, -24, 12, 10); ctx.fillRect(15, 14, 12, 10);
+            ctx.fillRect(-28, -25, 14, 12); ctx.fillRect(-28, 13, 14, 12);
+
+            ctx.restore();
+            ctx.restore();
+
+            document.getElementById('speed').innerText = `${Math.round(Math.abs(car.speed) * 8)} KM/H`;
+            document.getElementById('gear').innerText = car.speed > 2 ? "GEAR: D" : (car.speed < -2 ? "GEAR: R" : "GEAR: N");
+            document.getElementById('progress').innerText = `DIST: ${progress}m`;
+
+            if (!useAI) {
+                update();
+                sendState();
+            }
+            requestAnimationFrame(draw);
+        }
+        draw();
+    </script>
+</body>
+
+</html>
